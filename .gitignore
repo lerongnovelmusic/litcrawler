@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+*.spec.bak
+
+# PyInstaller 产物（可执行文件放 GitHub Releases，不入库）
+*.exe
+*.manifest
+
+# 运行时数据（用户配置、搜索记录、日志）
+data/
+*.log
+portable.txt
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

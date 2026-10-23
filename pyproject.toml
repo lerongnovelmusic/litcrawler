@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "litcrawler"
+version = "1.0.0"
+description = "学术文献多源检索与批量下载工具（关键词/期刊模糊匹配 + 影响因子筛选）"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "LitCrawler" }]
+keywords = ["literature", "crawler", "impact-factor", "pdf", "tkinter", "research"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: Microsoft :: Windows",
+    "Topic :: Education",
+    "Topic :: Scientific/Engineering",
+]
+# 运行只依赖标准库；openpyxl 仅用于 Excel 导入/导出
+dependencies = []
+
+[project.optional-dependencies]
+excel = ["openpyxl>=3.1"]
+build = ["pyinstaller>=6.0"]
+
+[project.scripts]
+litcrawler = "litcrawler.cli:main"
+
+[project.gui-scripts]
+litcrawler-gui = "litcrawler.gui:main"
+
+[tool.setuptools]
+packages = ["litcrawler", "litcrawler.core", "litcrawler.gui", "litcrawler.sources", "litcrawler.sources.adapters"]
+
+[tool.setuptools.package-data]
+litcrawler = ["resources/*.gz"]
