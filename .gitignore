@@ -16,6 +16,11 @@ data/
 *.log
 portable.txt
 
+# 下载的文献（版权归原作者，不要提交到仓库）
+下载的文献/
+*.pdf
+*.PDF
+
 # 编辑器 / 系统
 .vscode/
 .idea/

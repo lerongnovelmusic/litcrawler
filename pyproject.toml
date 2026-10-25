@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "litcrawler"
-version = "1.0.0"
+version = "1.1.0"
 description = "学术文献多源检索与批量下载工具（关键词/期刊模糊匹配 + 影响因子筛选）"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -17,7 +17,7 @@ classifiers = [
     "Topic :: Education",
     "Topic :: Scientific/Engineering",
 ]
-# 运行只依赖标准库；openpyxl 仅用于 Excel 导入/导出
+# 运行只依赖标准库；openpyxl 仅用�?Excel 导入/导出
 dependencies = []
 
 [project.optional-dependencies]

@@ -19,7 +19,7 @@ from typing import Callable, Iterable
 from . import http
 from .fuzzy import best_similarity, matches_journal, normalize, similarity
 from .impactfactor import ImpactFactorDB
-from .models import Paper, SearchResult, SourceReport
+from .models import Paper, RejectedPaper, SearchResult, SourceReport
 from ..sources import Source, SourceError, build_registry
 from ..sources.base import SourceRegistry
 from ..sources.sites import ProfileSource, SiteProfile
@@ -145,10 +145,13 @@ class SearchEngine:
                 break
             ok, reason = self._passes(paper, query)
             if not ok:
-                if reason:
-                    result.notes.append(reason)
+                self._reject(result, paper, reason)
                 continue
             self._annotate(paper, query)
+            ok_if, if_reason = self._passes_impact(paper, query)
+            if not ok_if:
+                self._reject(result, paper, if_reason)
+                continue
             kept.append(paper)
 
         kept.sort(key=lambda p: (-p.match_score, -(p.impact_factor or 0), -p.cited_by, -(p.year or 0)))
@@ -161,6 +164,120 @@ class SearchEngine:
                 if report.name in (p.extra.get("all_sources") or [p.source])
             )
         log(f"完成：命中 {len(result.papers)} 条（{result.elapsed:.1f}s）")
+        return result
+
+    # ------------------------------------------------------------------ #
+    # 快速「本地筛选」：新条件是旧条件的子集时，不必重新联网
+    # ------------------------------------------------------------------ #
+    REJECT_CAP = 400
+
+    @staticmethod
+    def _reject(result: SearchResult, paper: Paper, reason: str, kind: str = "未通过筛选") -> None:
+        if reason and len(result.rejected) < SearchEngine.REJECT_CAP:
+            result.rejected.append(RejectedPaper(paper, reason, kind))
+
+    @staticmethod
+    def can_refine(old: "SearchQuery | None", new: "SearchQuery") -> bool:
+        """新检索范围是否是上一次范围的**子集**（子集才能安全地本地筛选）。"""
+        if old is None:
+            return False
+        if (old.keyword or "").strip().lower() != (new.keyword or "").strip().lower():
+            return False
+        if old.if_year != new.if_year:
+            return False
+        # 模糊开关：只能从模糊收紧为严格，不能反过来（反过来会变宽）
+        if new.fuzzy_keyword and not old.fuzzy_keyword:
+            return False
+        if new.fuzzy_journal and not old.fuzzy_journal:
+            return False
+        if old.min_similarity and new.min_similarity < old.min_similarity:
+            return False
+        # 数据源：只能是旧的子集
+        if not set(new.sources) <= set(old.sources):
+            return False
+        # 期刊：新的清单必须是旧清单的子集（空=不限，不算子集）
+        old_j = {j.strip().lower() for j in old.journals if j.strip()}
+        new_j = {j.strip().lower() for j in new.journals if j.strip()}
+        if not new_j <= old_j:
+            return False
+        # 影响因子区间只能收窄
+        if new.min_impact_factor < old.min_impact_factor:
+            return False
+        if new.max_impact_factor:
+            if old.max_impact_factor and new.max_impact_factor > old.max_impact_factor:
+                return False
+        elif old.max_impact_factor:
+            return False
+        # 年份区间只能收窄
+        if new.year_from < old.year_from:
+            return False
+        if new.year_to:
+            if old.year_to and new.year_to > old.year_to:
+                return False
+        elif old.year_to:
+            return False
+        # 其它开关只能变严
+        if old.only_open_access and not new.only_open_access:
+            return False
+        if old.title_contains and old.title_contains.lower() not in new.title_contains.lower():
+            return False
+        if old.journal_contains and old.journal_contains.lower() not in new.journal_contains.lower():
+            return False
+        return True
+
+    def refine(
+        self,
+        previous: SearchResult,
+        old_query: SearchQuery,
+        new_query: SearchQuery,
+        *,
+        progress: ProgressFn | None = None,
+    ) -> SearchResult | None:
+        """在已有结果上做本地筛选；不可行时返回 ``None``（调用方应重新检索）。"""
+        log = progress or (lambda _m: None)
+        if not self.can_refine(old_query, new_query):
+            return None
+        # 结果集曾达到上限，放宽条数就需要新数据
+        if new_query.limit > old_query.limit and len(previous.papers) >= old_query.limit:
+            return None
+
+        started = time.time()
+        result = SearchResult(keyword=new_query.keyword, from_cache=True)
+        result.reports = [
+            SourceReport(name=r.name, found=r.found, error=r.error, elapsed=r.elapsed)
+            for r in previous.reports
+        ]
+        old_sources = {s.strip().lower() for s in old_query.sources}
+        new_sources = {s.strip().lower() for s in new_query.sources}
+        narrowed_sources = new_sources != old_sources
+
+        log("检索条件收窄，正在本地筛选上次结果（无需重新联网）…")
+        kept: list[Paper] = []
+        for paper in previous.papers:
+            if narrowed_sources:
+                paper_sources = {s.strip().lower() for s in (paper.extra.get("all_sources") or [paper.source]) if s}
+                if paper_sources and not (paper_sources & new_sources):
+                    self._reject(result, paper, "不在当前勾选的数据源中")
+                    continue
+            ok, reason = self._passes(paper, new_query)
+            if not ok:
+                self._reject(result, paper, reason or "不满足新的筛选条件")
+                continue
+            ok_if, if_reason = self._passes_impact(paper, new_query)
+            if not ok_if:
+                self._reject(result, paper, if_reason)
+                continue
+            kept.append(paper)
+
+        kept.sort(key=lambda p: (-p.match_score, -(p.impact_factor or 0), -p.cited_by, -(p.year or 0)))
+        result.papers = kept[: new_query.limit]
+        result.elapsed = time.time() - started
+        result.notes.append("复用上次检索结果做本地筛选（未重新联网）")
+        for report in result.reports:
+            report.kept = sum(
+                1 for p in result.papers if report.name in (p.extra.get("all_sources") or [p.source])
+            )
+        log(f"本地筛选完成：{len(result.papers)} 条（{result.elapsed:.2f}s，上一轮 {len(previous.papers)} 条）")
         return result
 
     # ------------------------------------------------------------------ #
@@ -267,15 +384,15 @@ class SearchEngine:
     # ------------------------------------------------------------------ #
     def _passes(self, paper: Paper, query: SearchQuery) -> tuple[bool, str]:
         if query.year_from and (paper.year or 0) and paper.year < query.year_from:
-            return False, ""
+            return False, f"年份 {paper.year} 早于 {query.year_from}"
         if query.year_to and (paper.year or 0) and paper.year > query.year_to:
-            return False, ""
+            return False, f"年份 {paper.year} 晚于 {query.year_to}"
         if query.only_open_access and not paper.is_oa:
-            return False, ""
+            return False, "不是开放获取（按设置排除）"
         if query.title_contains and query.title_contains.lower() not in paper.title.lower():
-            return False, ""
+            return False, f"标题不包含「{query.title_contains}」"
         if query.journal_contains and query.journal_contains.lower() not in paper.journal.lower():
-            return False, ""
+            return False, f"期刊名不包含「{query.journal_contains}」"
 
         # 期刊过滤
         if query.journals:
@@ -284,7 +401,7 @@ class SearchEngine:
             )
             if not hit:
                 # arXiv 等预印本没有期刊名，若用户勾了期刊就不应通过
-                return False, ""
+                return False, f"期刊「{paper.journal or '未知'}」不在指定期刊清单中"
             paper.matched_journal = matched
 
         # 关键词相似度（在本地做模糊判断）
@@ -297,7 +414,23 @@ class SearchEngine:
             if query.journal_strict or query.journals:
                 threshold = min(threshold, 0.25)  # 已按期刊筛选时放宽关键词
             if score < threshold:
-                return False, ""
+                return False, f"与关键词相似度 {score:.2f} 低于阈值 {threshold:.2f}"
+        return True, ""
+
+    @staticmethod
+    def _passes_impact(paper: Paper, query: SearchQuery) -> tuple[bool, str]:
+        """影响因子区间过滤（在 ``_annotate`` 之后调用）。"""
+        value = paper.impact_factor
+        if query.min_impact_factor:
+            if value is None:
+                return False, f"没有影响因子数据（要求 ≥ {query.min_impact_factor:g}）"
+            if value < query.min_impact_factor:
+                return False, f"影响因子 {value:g} 低于最低值 {query.min_impact_factor:g}"
+        if query.max_impact_factor:
+            if value is None:
+                return False, f"没有影响因子数据（要求 ≤ {query.max_impact_factor:g}）"
+            if value > query.max_impact_factor:
+                return False, f"影响因子 {value:g} 高于最高值 {query.max_impact_factor:g}"
         return True, ""
 
     # ------------------------------------------------------------------ #
@@ -393,12 +526,9 @@ class SearchEngine:
         for paper in papers:
             if self.impact_db is not None and paper.impact_factor is None:
                 self._annotate(paper, query)
-            value = paper.impact_factor
-            if query.min_impact_factor and (value is None or value < query.min_impact_factor):
-                continue
-            if query.max_impact_factor and (value is None or value > query.max_impact_factor):
-                continue
-            out.append(paper)
+            ok, _reason = self._passes_impact(paper, query)
+            if ok:
+                out.append(paper)
         return out
 
     def probe_sources(self, names: Iterable[str], *, mailto: str = "") -> dict[str, str]:

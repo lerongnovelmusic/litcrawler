@@ -16,7 +16,7 @@ from ..core import impactfactor
 from ..core.config import Config, HistoryEntry, logs_dir
 from ..core.downloader import Downloader, DownloadSummary
 from ..core.logging_setup import get_logger, install_excepthook, setup as setup_logging
-from ..core.models import Paper, SourceReport
+from ..core.models import Paper, RejectedPaper, SourceReport
 from ..core.search import SearchEngine, SearchQuery
 from ..sources import build_registry
 from ..sources.sites import BUILTIN_PROFILES, SiteProfile
@@ -27,14 +27,14 @@ from .widgets import (CHECK_OFF, CHECK_ON, PALETTE, BusyIndicator, ScrolledTreev
 RESULT_COLUMNS = [
     ("sel", "选", 40, "center"),
     ("idx", "#", 36, "center"),
-    ("title", "标题", 330, "w"),
-    ("journal", "期刊", 180, "w"),
-    ("impact", "影响因子", 84, "center"),
-    ("year", "年份", 56, "center"),
-    ("cited", "被引", 56, "center"),
-    ("oa", "开放获取", 70, "center"),
-    ("pdf", "PDF", 46, "center"),
-    ("source", "来源", 100, "w"),
+    ("title", "标题", 300, "w"),
+    ("journal", "期刊", 160, "w"),
+    ("impact", "影响因子", 96, "center"),
+    ("year", "年份", 60, "center"),
+    ("cited", "被引", 60, "center"),
+    ("oa", "开放获取", 84, "center"),
+    ("pdf", "PDF", 48, "center"),
+    ("source", "来源", 90, "w"),
 ]
 
 
@@ -109,6 +109,10 @@ class App(tk.Tk):
         self.item_ids: list[str] = []
         self.source_vars: dict[str, tk.BooleanVar] = {}
         self.last_query: SearchQuery | None = None
+        self.failures: list[RejectedPaper] = []
+        self._last_result = None      # 上一次检索结果，用于「条件收窄 → 本地筛选」
+        self._last_query: SearchQuery | None = None
+        self._last_was_local = False
         self.worker = Worker(self)
         self.downloader: Downloader | None = None
         self._searching = False
@@ -169,8 +173,15 @@ class App(tk.Tk):
         right = ttk.Frame(head)
         right.pack(side="right")
         ttk.Label(right, text="数据目录：", style="Sub.TLabel").pack(side="left")
-        ttk.Button(right, text="打开", width=6,
-                   command=lambda: open_path(self.config_obj.base)).pack(side="left")
+        open_btn = ttk.Button(right, text="打开文件夹", width=10,
+                              command=lambda: open_path(self.config_obj.base))
+        open_btn.pack(side="left")
+        Tooltip(open_btn,
+                "在资源管理器中打开程序的数据目录。\n\n"
+                "里面保存着：settings.json（你的设置）、history.json（搜索记录）、\n"
+                "journals.json（常用期刊）、impact_factor/（你导入的影响因子表）、\n"
+                "logs/（运行日志）。\n\n"
+                "迁移或备份时，复制整个文件夹即可。")
         ttk.Button(right, text="⚙ 设置", width=8,
                    command=self.open_settings).pack(side="left", padx=(6, 0))
 
@@ -287,7 +298,14 @@ class App(tk.Tk):
         for idx, meta in enumerate(metas):
             var = tk.BooleanVar(value=meta.name in self.settings.sources)
             self.source_vars[meta.name] = var
-            cb = ttk.Checkbutton(grid, text=meta.label, variable=var)
+            # 用经典 Checkbutton：选中时显示对勾，并配浅绿色底，比主题默认的叉号更直观
+            cb = tk.Checkbutton(
+                grid, text=meta.label, variable=var,
+                bg=PALETTE["bg"], activebackground=PALETTE["bg"],
+                selectcolor="#86efac", font=pick_font(self, 10),
+                bd=0, highlightthickness=0, anchor="w", padx=2, pady=1,
+                cursor="hand2",
+            )
             cb.grid(row=idx // 3, column=idx % 3, sticky="w", padx=(0, 16), pady=1)
             Tooltip(cb, f"{meta.description}\n主页：{meta.homepage}")
 
@@ -395,7 +413,17 @@ class App(tk.Tk):
         self.filter_label = ttk.Label(filt, text="", style="Sub.TLabel")
         self.filter_label.pack(side="left", padx=(10, 0))
 
-        table = ScrolledTreeview(parent, RESULT_COLUMNS)
+        # 结果区：上方「检索结果 / 失败记录」页签，下方可拖动的日志面板
+        self.results_paned = ttk.Panedwindow(parent, orient="vertical")
+        self.results_paned.pack(fill="both", expand=True)
+
+        self.nb = ttk.Notebook(self.results_paned)
+        result_tab = ttk.Frame(self.nb)
+        fail_tab = ttk.Frame(self.nb)
+        self.nb.add(result_tab, text="检索结果")
+        self.nb.add(fail_tab, text="失败记录 (0)")
+
+        table = ScrolledTreeview(result_tab, RESULT_COLUMNS)
         table.pack(fill="both", expand=True)
         self.table = table.tree
         self.table.configure(height=7)  # 最小行数，窗口变大时由 expand 拉高
@@ -404,6 +432,41 @@ class App(tk.Tk):
         self.table.bind("<Double-1>", lambda _e: self.show_details())
         self.table.bind("<Button-3>", self._show_context_menu)
         self.table.bind("<Control-a>", lambda _e: (self.select_all(), "break")[1])
+
+        fail_cols = [
+            ("idx", "#", 36, "center"),
+            ("title", "标题", 230, "w"),
+            ("journal", "期刊", 130, "w"),
+            ("impact", "影响因子", 96, "center"),
+            ("year", "年份", 60, "center"),
+            ("kind", "类型", 110, "center"),
+            ("reason", "失败 / 排除原因", 320, "w"),
+        ]
+        self.fail_summary = ttk.Label(fail_tab, text="", style="Sub.TLabel")
+        self.fail_summary.pack(fill="x", padx=4, pady=(2, 2))
+        fail_body = ttk.Frame(fail_tab)
+        fail_body.pack(fill="both", expand=True)
+        self.fail_tree = ttk.Treeview(fail_body, columns=[c[0] for c in fail_cols],
+                                      show="headings", selectmode="browse")
+        for key, title, width, anchor in fail_cols:
+            self.fail_tree.heading(key, text=title)
+            self.fail_tree.column(key, width=width, anchor=anchor,
+                                  stretch=(key in {"title", "reason"}))
+        fail_vsb = ttk.Scrollbar(fail_body, orient="vertical", command=self.fail_tree.yview)
+        fail_hsb = ttk.Scrollbar(fail_body, orient="horizontal", command=self.fail_tree.xview)
+        self.fail_tree.configure(yscrollcommand=fail_vsb.set, xscrollcommand=fail_hsb.set)
+        self.fail_tree.grid(row=0, column=0, sticky="nsew")
+        fail_vsb.grid(row=0, column=1, sticky="ns")
+        fail_hsb.grid(row=1, column=0, sticky="ew")
+        fail_body.rowconfigure(0, weight=1)
+        fail_body.columnconfigure(0, weight=1)
+        self.fail_tree.tag_configure("fail", foreground="#b91c1c")
+        self.fail_tree.bind("<Double-1>", lambda _e: self._show_failure_detail())
+        Tooltip(self.fail_tree,
+                "这里列出两类记录：\n"
+                "1) 检索到但被条件筛掉的文献（如影响因子不够、期刊不符）；\n"
+                "2) 下载失败的文献（订阅限制、链接失效等）。\n"
+                "显示条数可在「设置 → 通用」里调整。")
 
         menu = tk.Menu(self, tearoff=0)
         menu.add_command(label="查看详情", command=self.show_details)
@@ -416,15 +479,27 @@ class App(tk.Tk):
         menu.add_command(label="打开 PDF 链接", command=self.open_pdf)
         self.context_menu = menu
 
-        log_wrap = ttk.Labelframe(parent, text="检索日志", padding=6, height=122)
-        log_wrap.pack(fill="x", expand=False, pady=(6, 0))
-        log_wrap.pack_propagate(False)
-        self.log_text = tk.Text(log_wrap, height=4, wrap="word", relief="flat",
+        log_wrap = ttk.Labelframe(self.results_paned, text="检索日志", padding=6)
+        self.log_text = tk.Text(log_wrap, height=5, wrap="word", relief="flat",
                                 background=PALETTE["panel"], font=pick_font(self, 9), padx=6, pady=4)
         log_vsb = ttk.Scrollbar(log_wrap, orient="vertical", command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=log_vsb.set, state="disabled")
         self.log_text.pack(side="left", fill="both", expand=True)
         log_vsb.pack(side="right", fill="y")
+        Tooltip(log_wrap, "上下拖动这条分隔线可以调整日志栏高度")
+
+        self.results_paned.add(self.nb, weight=4)
+        self.results_paned.add(log_wrap, weight=1)
+        self.after(200, self._init_results_sash)
+
+    def _init_results_sash(self) -> None:
+        """把结果区/日志区的分隔线放到合适位置（高度 60% / 40%）。"""
+        try:
+            height = self.results_paned.winfo_height()
+            if height > 200:
+                self.results_paned.sashpos(0, int(height * 0.66))
+        except tk.TclError:
+            pass
 
     def _build_status(self) -> None:
         bar = ttk.Frame(self, padding=(12, 6))
@@ -497,9 +572,22 @@ class App(tk.Tk):
         self.log("=" * 60)
         self.log(f"检索条件：{query.describe()}")
         self._clear_table()
+        self._set_failures([])
         self.result_label.configure(text="检索中…")
 
+        previous_result = self._last_result
+        previous_query = self._last_query
+
         def task(worker: Worker) -> None:
+            # 条件收窄（例如提高最低影响因子、缩小期刊范围）时，直接在旧结果上筛选
+            if previous_result is not None and previous_query is not None:
+                refined = self.engine.refine(
+                    previous_result, previous_query, query,
+                    progress=lambda msg: worker.post("log", msg),
+                )
+                if refined is not None:
+                    worker.post("refined", refined)
+                    return
             result = self.engine.search(
                 query,
                 mailto=self.settings.openalex_mailto or self.settings.crossref_mailto,
@@ -534,7 +622,9 @@ class App(tk.Tk):
     def _on_search_message(self, kind: str, payload: Any) -> None:
         if kind == "log":
             self.log(str(payload))
-        elif kind == "result":
+        elif kind in {"result", "refined"}:
+            if kind == "refined":
+                self._last_was_local = True
             self._show_result(payload)
         elif kind == "error":
             self.log(f"❌ 检索异常：{payload}")
@@ -555,15 +645,25 @@ class App(tk.Tk):
             self.only_selected_var.set(False)
         self._fill_table()
         total_raw = result.total_raw
+        self._last_result = result
+        self._last_query = self.last_query
+        self._last_was_local = bool(getattr(result, "from_cache", False))
+
+        self._set_failures(list(result.rejected))
+        suffix = "（本地筛选）" if self._last_was_local else ""
         self.result_label.configure(
-            text=f"命中 {len(self.papers)} 条 / 原始 {total_raw} 条 · 耗时 {result.elapsed:.1f}s")
+            text=f"命中 {len(self.papers)} 条 / 原始 {total_raw} 条 · 耗时 {result.elapsed:.1f}s{suffix}")
+        if self._last_was_local:
+            self.log("⚡ 条件收窄：直接复用上次检索结果做本地筛选，未重新联网")
         for report in result.reports:
             mark = "✗" if report.error else "✓"
             self.log(f"  {mark} {report.name}：{report.status}")
         if not self.papers:
             self.log("没有符合条件的结果。可尝试：降低最低影响因子、放宽期刊限制、或勾选更多数据源。")
+        if self.failures:
+            self.log(f"另有 {len(self.failures)} 条被筛掉/失败，详见「失败记录」页签。")
 
-        entry = self.config_obj.history.add(
+        self.config_obj.history.add(
             HistoryEntry(
                 timestamp=time.time(),
                 keyword=result.keyword,
@@ -576,6 +676,82 @@ class App(tk.Tk):
         )
         self._refresh_history()
         self._update_selection_label()
+
+    # ------------------------------------------------------------------ #
+    # 失败记录
+    # ------------------------------------------------------------------ #
+    def _set_failures(self, items: list) -> None:
+        self.failures = list(items)
+        self._refresh_failures()
+
+    def _refresh_failures(self) -> None:
+        """刷新「失败记录」页签（红色标记，显示条数由设置决定）。"""
+        if not hasattr(self, "fail_tree"):
+            return
+        limit = max(1, int(getattr(self.settings, "failure_limit", 30) or 30))
+        shown = self.failures[:limit]
+        self.fail_tree.delete(*self.fail_tree.get_children())
+        for idx, item in enumerate(shown, start=1):
+            try:
+                values = item.to_row(idx)
+            except Exception:
+                continue
+            self.fail_tree.insert("", "end", values=values, tags=("fail",))
+        total = len(self.failures)
+        label = f"失败记录 ({total})" if total else "失败记录"
+        try:
+            self.nb.tab(1, text=label)
+        except tk.TclError:
+            pass
+        if hasattr(self, "fail_summary"):
+            if total == 0:
+                self.fail_summary.configure(
+                    text="暂无失败记录。检索被筛掉的文献、下载失败的文献都会列在这里。")
+            elif total > len(shown):
+                self.fail_summary.configure(
+                    text=f"共 {total} 条，当前显示前 {len(shown)} 条（可在「设置 → 通用」中调整上限）；双击查看详情")
+            else:
+                self.fail_summary.configure(text=f"共 {total} 条；双击查看详情")
+
+    def _append_download_failures(self, tasks) -> None:
+        """把下载失败的条目补充到「失败记录」页签。"""
+        added = []
+        for task in tasks:
+            if task.status not in {"failed", "no_pdf"}:
+                continue
+            kind = "无全文" if task.status == "no_pdf" else "下载失败"
+            added.append(RejectedPaper(task.paper, task.message or "未知原因", kind))
+        if added:
+            self.failures.extend(added)
+            self._refresh_failures()
+            self.nb.select(1)
+            self.log(f"已把 {len(added)} 条下载失败记录加入「失败记录」页签。")
+
+    def _show_failure_detail(self) -> None:
+        selection = self.fail_tree.selection()
+        if not selection:
+            return
+        idx = self.fail_tree.index(selection[0])
+        if idx >= len(self.failures):
+            return
+        item = self.failures[idx]
+        paper = item.paper
+        lines = [
+            f"类型：{item.kind}",
+            f"原因：{item.reason or item.detail}",
+            "",
+            f"标题：{paper.title}",
+            f"期刊：{paper.journal or '—'}",
+            f"影响因子：{paper.if_text}",
+            f"年份：{paper.year or '—'}",
+            f"DOI：{paper.doi or '—'}",
+            f"页面：{paper.url or '—'}",
+            "",
+            "PDF 候选地址：",
+        ]
+        lines += [f"  {i}. {u}" for i, u in enumerate(paper.pdf_urls, 1)] or ["  （无）"]
+        lines += ["", "摘要：", paper.abstract or "（无摘要）"]
+        TextDialog(self, "失败记录详情", "\n".join(lines))
 
     # ------------------------------------------------------------------ #
     def _fill_table(self) -> None:
@@ -856,13 +1032,15 @@ class App(tk.Tk):
                 f"失败 {len(failed)} 篇，共 {summary.total_bytes/1024/1024:.2f} MB。")
         self.log(text)
         self.result_label.configure(text=text)
+        self._append_download_failures(summary.tasks)
         if self.auto_confirm:  # 自动化/无头模式：不弹窗、不打开目录
             return
         if failed:
             detail = "\n".join(f"• {t.paper.title[:70]}\n   原因：{t.message}" for t in failed[:12])
             if len(failed) > 12:
                 detail += f"\n… 另有 {len(failed) - 12} 条失败"
-            TextDialog(self, "下载失败的文献", text + "\n\n" + detail)
+            TextDialog(self, "下载失败的文献", text + "\n\n" + detail +
+                       "\n\n提示：这些记录也已加入「失败记录」页签（红色标记）。")
         else:
             messagebox.showinfo("下载完成", text, parent=self)
         if summary.directory:
@@ -1180,9 +1358,22 @@ class SettingsDialog(tk.Toplevel):
         nb.add(frame, text="通用")
         s = self.app.settings
 
-        ttk.Label(frame, text="联系邮箱（OpenAlex/Crossref 礼貌池，可留空）", style="Section.TLabel").pack(anchor="w")
+        ttk.Label(frame, text="联系邮箱（可选，建议填写）", style="Section.TLabel").pack(anchor="w")
         self.mailto_var = tk.StringVar(value=s.openalex_mailto)
-        ttk.Entry(frame, textvariable=self.mailto_var, width=48).pack(anchor="w", pady=(2, 10))
+        mail_entry = ttk.Entry(frame, textvariable=self.mailto_var, width=48)
+        mail_entry.pack(anchor="w", pady=(2, 4))
+        Tooltip(mail_entry,
+                "OpenAlex / Crossref 要求自动化程序在请求里带上联系方式，\n"
+                "填了邮箱会进入它们的「礼貌池 (polite pool)」：\n"
+                "请求优先级更高、更不容易被限流，出问题时对方也能联系你。\n"
+                "留空也能用，只是可能慢一点或被限流。")
+        ttk.Label(
+            frame,
+            text="作用是加入 OpenAlex / Crossref 的「礼貌池」：请求会附带 mailto 参数，"
+                 "更容易获得稳定、快速的响应，降低被限流的概率。\n"
+                 "只写入请求头/参数，不会上传到其它地方，也不会公开显示。随便填个常用邮箱即可。",
+            style="Sub.TLabel", wraplength=640, justify="left",
+        ).pack(anchor="w", pady=(0, 12))
 
         ttk.Label(frame, text="并发下载数（1–8）", style="Section.TLabel").pack(anchor="w")
         self.workers_var = tk.IntVar(value=s.concurrent_downloads)
@@ -1195,6 +1386,14 @@ class SettingsDialog(tk.Toplevel):
         ttk.Label(frame, text="影响因子数据年份（留空=最新）", style="Section.TLabel").pack(anchor="w")
         self.if_year_var = tk.StringVar(value=s.if_data_year)
         ttk.Entry(frame, textvariable=self.if_year_var, width=10).pack(anchor="w", pady=(2, 10))
+
+        ttk.Label(frame, text="「失败记录」最多显示条数", style="Section.TLabel").pack(anchor="w")
+        self.failure_limit_var = tk.IntVar(value=max(1, int(getattr(s, "failure_limit", 30) or 30)))
+        fail_spin = ttk.Spinbox(frame, from_=1, to=500, increment=10,
+                                textvariable=self.failure_limit_var, width=6)
+        fail_spin.pack(anchor="w", pady=(2, 10))
+        Tooltip(fail_spin, "检索中被筛掉的文献、以及下载失败的文献，会以红色列在「失败记录」页签中；\n"
+                           "这里控制最多显示多少条（其余仍会保留在数据里，可调大后查看）。")
 
         ttk.Label(frame, text=f"数据目录：{self.app.config_obj.base}", style="Sub.TLabel").pack(anchor="w", pady=(10, 0))
         row = ttk.Frame(frame)
@@ -1318,8 +1517,10 @@ class SettingsDialog(tk.Toplevel):
         s.concurrent_downloads = max(1, min(8, _safe_int(str(self.workers_var.get()), 4)))
         s.request_timeout = max(10.0, float(self.timeout_var.get() or 30))
         s.if_data_year = self.if_year_var.get().strip()
+        s.failure_limit = max(1, min(500, _safe_int(str(self.failure_limit_var.get()), 30)))
         self.app.config_obj.save_settings()
         self.app.config_obj.sites.replace([p.to_dict() for p in self.app.site_profiles])
+        self.app._refresh_failures()
         self.app.log("设置已保存。")
         self._close()
 
@@ -1406,17 +1607,28 @@ HELP_TEXT = """【LitCrawler 使用说明】
  · 只下载开放获取（OA）文献的 PDF 直链；程序不会绕过付费墙；
  · 已存在的同名文件会自动跳过；文件名格式可选「年份_作者_标题 / 仅标题 / 年份_作者_DOI」；
  · 失败的文献会在弹窗中列出具体原因（订阅限制、站点拒绝、非 PDF 响应等），
-   可以复制其链接后手动获取。
+   同时以红色记录在「失败记录」页签里，可复制其链接后手动获取。
 
-五、搜索记录
+五、失败记录（红色）
+ · 结果区上方有两个页签：「检索结果」和「失败记录」；
+ · 失败记录里包含两类：检索到但被条件筛掉的文献（影响因子不够、期刊不符、非 OA 等），
+   以及下载失败的文献，都写明具体原因；
+ · 双击任意一行可查看详情；最多显示多少条可在「设置 → 通用」中调整。
+
+六、搜索记录
  · 每次检索都会记入左侧「搜索记录」列表，双击即可还原全部条件并重新检索。
 
-六、自定义站点
+七、速度小技巧
+ · 把条件「收窄」（提高最低影响因子、缩小年份范围、减少数据源或期刊）时，
+   程序会直接在上一次结果里本地筛选，不再联网，通常 0.1 秒内完成；
+ · 只有放宽条件（降低影响因子、换关键词、加数据源）才会重新检索。
+
+八、自定义站点
  · 「设置 → 自定义站点」可添加有检索结果页的期刊网站：填写含 {query} 的地址模板，
    再给出结果区块 / 标题 / 作者 / PDF 等正则表达式即可接入。
  · 仅支持服务端渲染的页面；需要登录或依赖 JavaScript 的站点无法直接抓取。
 
-七、常见问题
+九、常见问题
  · 结果太少？放宽影响因子、清空期刊限制、增加结果上限、多勾几个数据源。
  · 期刊没有影响因子？该刊可能未被 JCR 收录，或需要导入你自己的数据。
  · 下载失败？多数订阅文献没有合法免费全文，请通过机构权限获取。

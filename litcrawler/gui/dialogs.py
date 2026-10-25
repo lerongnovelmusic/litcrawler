@@ -35,12 +35,13 @@ class JournalPickerDialog(tk.Toplevel):
         # 搜索框
         search_row = ttk.Frame(outer)
         search_row.pack(fill="x", pady=(0, 6))
-        ttk.Label(search_row, text="过滤：").pack(side="left")
+        ttk.Label(search_row, text="期刊名：").pack(side="left")
         self.filter_var = tk.StringVar()
         entry = ttk.Entry(search_row, textvariable=self.filter_var)
         entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
         entry.bind("<KeyRelease>", lambda _e: self._refresh())
-        Tooltip(entry, "输入关键词筛选下方期刊列表，也可直接点“添加”把输入内容保存为新期刊")
+        Tooltip(entry, "在这里输入期刊名可筛选下方列表；\n"
+                       "输入一个不在列表里的新期刊名，再点「添加并保存」即可加入常用期刊")
 
         # 列表
         list_frame = ttk.Frame(outer)

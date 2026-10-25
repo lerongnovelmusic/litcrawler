@@ -155,6 +155,32 @@ class SourceReport:
 
 
 @dataclass
+class RejectedPaper:
+    """被筛掉的文献及其原因（用于界面的「失败记录」）。"""
+
+    paper: Paper
+    reason: str = ""
+    kind: str = "未通过筛选"   # 未通过筛选 / 无全文 / 下载失败
+    detail: str = ""
+
+    @property
+    def label(self) -> str:
+        return self.kind
+
+    def to_row(self, index: int) -> tuple:
+        p = self.paper
+        return (
+            index,
+            p.title[:200],
+            p.journal or "—",
+            p.if_text,
+            p.year or "—",
+            self.kind,
+            self.reason or self.detail,
+        )
+
+
+@dataclass
 class SearchResult:
     """一次检索的完整结果。"""
 
@@ -163,6 +189,8 @@ class SearchResult:
     keyword: str = ""
     elapsed: float = 0.0
     notes: list[str] = field(default_factory=list)
+    rejected: list[RejectedPaper] = field(default_factory=list)
+    from_cache: bool = False
 
     @property
     def total_raw(self) -> int:

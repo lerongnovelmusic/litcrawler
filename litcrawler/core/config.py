@@ -80,6 +80,7 @@ class Settings:
     crossref_mailto: str = ""
     concurrent_downloads: int = 4
     request_timeout: float = 30.0
+    failure_limit: int = 30  # 「失败记录」最多展示条数
     if_data_year: str = ""  # 影响因子数据年份
     use_bundled_impact_factor: bool = True
     theme: str = "clam"
